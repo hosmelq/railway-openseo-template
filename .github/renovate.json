@@ -1,0 +1,17 @@
+{
+  "extends": [
+    "config:recommended",
+    "docker:pinDigests"
+  ],
+  "packageRules": [
+    {
+      "allowedVersions": "/^v\\d+\\.\\d+\\.\\d+$/",
+      "matchManagers": [
+        "dockerfile"
+      ],
+      "matchPackageNames": [
+        "ghcr.io/every-app/open-seo"
+      ]
+    }
+  ]
+}

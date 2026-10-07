@@ -1,0 +1,68 @@
+name: Publish image
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/publish-image.yml
+      - .dockerignore
+      - Caddyfile
+      - Dockerfile
+      - build-fingerprint.mjs
+      - railway-entrypoint.mjs
+      - tests/**
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/publish-image.yml
+      - .dockerignore
+      - Caddyfile
+      - Dockerfile
+      - build-fingerprint.mjs
+      - railway-entrypoint.mjs
+      - tests/**
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-image
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build once in GitHub
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: openseo-smoke:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Verify authentication, MCP, persistence and resource limits
+        run: python3 tests/smoke.py openseo-smoke:ci
+      - name: Publish verified image
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          REVISION: ${{ github.sha }}
+        run: |
+          docker tag openseo-smoke:ci "$IMAGE:latest"
+          docker tag openseo-smoke:ci "$IMAGE:sha-$REVISION"
+          docker push "$IMAGE:sha-$REVISION"
+          docker push "$IMAGE:latest"

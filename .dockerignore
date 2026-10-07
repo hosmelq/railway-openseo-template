@@ -1,0 +1,5 @@
+*
+!Dockerfile
+!Caddyfile
+!build-fingerprint.mjs
+!railway-entrypoint.mjs
