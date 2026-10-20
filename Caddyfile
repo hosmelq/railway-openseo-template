@@ -1,0 +1,53 @@
+{
+  admin off
+  auto_https off
+}
+:{$PORT:8080} {
+  map {http.request.header.X-Forwarded-Proto} {public_scheme} {
+    https https
+    default {http.request.scheme}
+  }
+  handle /healthz {
+    reverse_proxy 127.0.0.1:3002
+  }
+  handle /cdn-cgi/* {
+    respond "Not found" 404
+  }
+  @mcp path /mcp /mcp/*
+  handle @mcp {
+    @token header Authorization "Bearer {$ACCESS_PASSWORD}"
+    handle @token {
+      reverse_proxy 127.0.0.1:3001 {
+        header_up -Authorization
+        header_up X-Forwarded-Proto {public_scheme}
+        flush_interval -1
+      }
+    }
+    handle {
+      respond "Unauthorized" 401
+    }
+  }
+  @session header_regexp Cookie "(^|;[ ]*)openseo_gate={$GATE_COOKIE}($|;)"
+  handle @session {
+    reverse_proxy 127.0.0.1:3001 {
+      header_up -Authorization
+      header_up X-Forwarded-Proto {public_scheme}
+      flush_interval -1
+    }
+  }
+  handle {
+    route {
+      basic_auth {
+        {$ACCESS_USERNAME:admin} {$PASSWORD_HASH}
+      }
+      # Issue a cookie only after basic_auth succeeds. Browsers can then
+      # authenticate SAM's WebSocket even when they omit the Basic header.
+      header Set-Cookie "openseo_gate={$GATE_COOKIE}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=2592000"
+      reverse_proxy 127.0.0.1:3001 {
+        header_up -Authorization
+        header_up X-Forwarded-Proto {public_scheme}
+        flush_interval -1
+      }
+    }
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "automerge": true,
+  "enabledManagers": ["dockerfile", "github-actions"],
+  "extends": ["config:recommended", "docker:pinDigests", "group:all"],
+  "platformAutomerge": false,
+  "semanticCommits": "enabled"
+}

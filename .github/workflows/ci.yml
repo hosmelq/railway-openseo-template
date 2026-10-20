@@ -1,0 +1,41 @@
+concurrency:
+  cancel-in-progress: true
+  group: ci-${{ github.ref }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+      - name: Build image
+        uses: docker/build-push-action@v7
+        with:
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          context: .
+          load: true
+          platforms: linux/amd64
+          pull: true
+          tags: openseo-smoke:ci
+      - name: Verify authentication, MCP, persistence and resource limits
+        run: python3 tests/smoke.py openseo-smoke:ci
+    timeout-minutes: 35
+
+name: CI
+
+on:
+  pull_request:
+    paths:
+      - .dockerignore
+      - .github/workflows/**
+      - Caddyfile
+      - Dockerfile
+      - build-fingerprint.mjs
+      - railway-entrypoint.mjs
+      - tests/**
+
+permissions:
+  contents: read
