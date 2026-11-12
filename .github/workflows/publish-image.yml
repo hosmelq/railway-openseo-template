@@ -40,9 +40,9 @@ jobs:
         name: Publish verified image
         run: |
           docker tag openseo-smoke:ci "$IMAGE:sha-$REVISION"
-          docker tag openseo-smoke:ci "$IMAGE:latest"
+          docker tag openseo-smoke:ci "$IMAGE:standalone"
           docker push "$IMAGE:sha-$REVISION"
-          docker push "$IMAGE:latest"
+          docker push "$IMAGE:standalone"
     timeout-minutes: 35
 
 name: Publish image
@@ -55,7 +55,6 @@ on:
       - .github/workflows/publish-image.yml
       - Caddyfile
       - Dockerfile
-      - build-fingerprint.mjs
       - railway-entrypoint.mjs
       - tests/**
   schedule:

@@ -1,9 +1,5 @@
-"""Exercise the actual image, including a fresh container over retained state."""
-
-import base64
 import json
 import secrets
-import shlex
 import subprocess
 import sys
 import time
@@ -13,160 +9,250 @@ import urllib.request
 image = sys.argv[1]
 suffix = secrets.token_hex(5)
 name = "openseo-smoke-" + suffix
+network = name + "-net"
+storage = name + "-storage"
 volume = name + "-data"
-password = secrets.token_hex(24)
-username = "admin"
+storage_volume = storage + "-data"
+access_key = "smoke" + suffix
+secret_key = secrets.token_hex(24)
+bucket = "openseo"
+email = "admin@example.com"
+password = secrets.token_hex(16)
+origin = "https://openseo.test"
 base = None
-basic = "Basic " + base64.b64encode(("admin:" + password).encode()).decode()
-bearer = "Bearer " + password
-
+EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+STORAGE_IMAGE = "rustfs/rustfs:1.0.3@sha256:9ca9559533b537d10482fe923288b676ad08f92a7069d9a17327fbae3cab688b"
 
 def docker(*args, check=True):
     return subprocess.run(
         ["docker", *args], check=check, text=True, capture_output=True
     ).stdout.strip()
 
+def logs_of(container):
+    return subprocess.run(
+        ["docker", "logs", container], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+    ).stdout
 
-def call(path, headers=None, body=None):
-    headers = {"Host": "openseo.test", "X-Forwarded-Proto": "https", **(headers or {})}
-    request = urllib.request.Request(base + path, headers=headers, data=body)
+def call(path, headers=None, body=None, method=None):
+    headers = {
+        "Host": "openseo.test",
+        "Origin": origin,
+        "X-Forwarded-Proto": "https",
+        **(headers or {}),
+    }
+    request = urllib.request.Request(
+        base + path, headers=headers, data=body, method=method
+    )
     try:
-        response = urllib.request.urlopen(request, timeout=30)
+        response = urllib.request.urlopen(request, timeout=60)
     except urllib.error.HTTPError as error:
         response = error
     return response.status, response.read().decode(), response.headers
 
+def post_json(path, payload, headers=None):
+    return call(
+        path,
+        {"Content-Type": "application/json", **(headers or {})},
+        json.dumps(payload).encode(),
+    )
 
-def rpc(method, params=None):
-    status, body, _ = call(
+def sign_in(user_email, user_password):
+    status, body, headers = post_json(
+        "/api/auth/sign-in/email", {"email": user_email, "password": user_password}
+    )
+    cookies = [
+        value.split(";")[0] for key, value in headers.items() if key == "Set-Cookie"
+    ]
+    return status, "; ".join(cookies)
+
+def rpc(key, method, params=None):
+    status, body, _ = post_json(
         "/mcp",
+        {"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}},
         {
-            "Authorization": bearer,
-            "Content-Type": "application/json",
+            "Authorization": "Bearer " + key,
             "Accept": "application/json, text/event-stream",
         },
-        json.dumps(
-            {"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}}
-        ).encode(),
     )
     assert status == 200, (method, status, body[:200])
-    result = json.loads(body)
+    result = json.loads(body[body.index("{") :])
     assert "error" not in result, (method, result)
     return result["result"]
 
+def tool(key, tool_name, arguments):
+    result = rpc(key, "tools/call", {"name": tool_name, "arguments": arguments})
+    assert not result.get("isError"), (tool_name, result)
+    return result
 
-def start(runtime_env=None, stale_snapshot=False, delayed_preview=False):
+def app_env(extra):
+    env = {
+        "CELLD_BUCKET": bucket,
+        "S3_ENDPOINT": "http://" + storage + ":9000",
+        "AWS_REGION": "us-east-1",
+        "AWS_ACCESS_KEY_ID": access_key,
+        "AWS_SECRET_ACCESS_KEY": secret_key,
+        "PORT": "3000",
+        "RAILWAY_PUBLIC_DOMAIN": "openseo.test",
+        **extra,
+    }
+    return [arg for key, value in env.items() for arg in ("-e", key + "=" + value)]
+
+def start(extra=None):
     global base
-    extra_env = [
-        arg
-        for key, value in (runtime_env or {}).items()
-        for arg in ("-e", key + "=" + value)
-    ]
-    setup = []
-    if stale_snapshot:
-        setup.append(
-            "printf 'AUTH_MODE=local_noauth\\nDATAFORSEO_API_KEY=Y2lAZXhhbXBsZS5jb206c3RhbGUtYnVpbGQtZml4dHVyZQ==\\n' > /app/dist/server/.dev.vars"
-        )
-    if delayed_preview:
-        # Keep the real application, but make its startup race deterministic.
-        setup.append(
-            "node -e "
-            + shlex.quote(
-                'const fs = require("node:fs"); '
-                'const file = "scripts/selfhost-scheduler.mjs"; '
-                'fs.writeFileSync(file, "await new Promise(resolve => setTimeout(resolve, 5000));\\n" '
-                '+ fs.readFileSync(file, "utf8"));'
-            )
-        )
-    command = (
-        (
-            "--entrypoint",
-            "/bin/sh",
-            image,
-            "-c",
-            " && ".join([*setup, "exec node /opt/railway/railway-entrypoint.mjs"]),
-        )
-        if setup
-        else (image,)
-    )
     docker(
         "run",
         "-d",
         "--name",
         name,
+        "--network",
+        network,
         "--cpus",
-        "0.5",
+        "1",
         "--memory",
-        "1g",
+        "2g",
         "-p",
-        "127.0.0.1::8080",
+        "127.0.0.1::3000",
         "-v",
         volume + ":/data",
-        "-e",
-        "ACCESS_PASSWORD=" + password,
-        "-e",
-        "OPENSEO_TELEMETRY_DISABLED=1",
-        "-e",
-        "ACCESS_USERNAME=" + username,
-        "-e",
-        "RAILWAY_PUBLIC_DOMAIN=openseo.test",
-        *extra_env,
-        *command,
+        *app_env(extra or {}),
+        image,
     )
     port = json.loads(docker("inspect", name))[0]["NetworkSettings"]["Ports"][
-        "8080/tcp"
+        "3000/tcp"
     ][0]["HostPort"]
     base = "http://127.0.0.1:" + port
-    startup_auth = (
-        "Basic " + base64.b64encode((username + ":" + password).encode()).decode()
-    )
-    deadline = time.monotonic() + 240
+    deadline = time.monotonic() + 300
     while time.monotonic() < deadline:
         try:
-            status, body, _ = call("/api/health", {"Authorization": startup_auth})
+            status, body, _ = call("/api/health")
         except (OSError, urllib.error.URLError):
             pass
         else:
-            assert status == 200, (
-                "Gateway accepted traffic before OpenSEO and its database were ready.",
-                status,
-                body[:200],
-            )
+            assert status == 200, (status, body[:200])
             assert json.loads(body)["checks"]["database"]["status"] == "ok", body
-            assert call("/healthz")[:2] == (200, "ok")
             return
         state = json.loads(docker("inspect", name))[0]["State"]
-        assert state["Running"], state
-        time.sleep(0.1)
-    raise AssertionError("Image did not become healthy within four minutes.")
+        assert state["Running"], (state, logs_of(name)[-3000:])
+        time.sleep(0.5)
+    raise AssertionError("Image did not become healthy within five minutes.")
 
+def stop():
+    docker("stop", "-t", "60", name)
+    logs = logs_of(name)
+    docker("rm", name)
+    return logs
+
+def refused(extra, message, legacy=False):
+    probe = name + "-refused"
+    if legacy:
+        docker("run", "--rm", "-u", "0", "-v", probe + ":/data", "--entrypoint", "mkdir", image, "-p", "/data/state/v3")
+    docker(
+        "run",
+        "--name",
+        probe,
+        "--network",
+        network,
+        "-v",
+        probe + ":/data",
+        *app_env(extra),
+        image,
+        check=False,
+    )
+    logs = logs_of(probe)
+    state = json.loads(docker("inspect", probe))[0]["State"]
+    docker("rm", "-f", probe, check=False)
+    docker("volume", "rm", probe, check=False)
+    assert state["ExitCode"] != 0, logs[-3000:]
+    assert message in logs, logs[-3000:]
 
 try:
-    docker("volume", "create", volume)
-    start(stale_snapshot=True, delayed_preview=True)
-    for path in ["/", "/mcp", "/mcp/", "/mcp?test=1", "/api/health"]:
-        status, _, headers = call(path)
-        assert status == 401, (path, status)
-        assert not headers.get("Set-Cookie"), (
-            "Unauthenticated requests must never receive a session."
+    docker("network", "create", network)
+    docker(
+        "run",
+        "-d",
+        "--name",
+        storage,
+        "--network",
+        network,
+        "-v",
+        storage_volume + ":/data",
+        "-u",
+        "0",
+        "-e",
+        "RUSTFS_ACCESS_KEY=" + access_key,
+        "-e",
+        "RUSTFS_SECRET_KEY=" + secret_key,
+        STORAGE_IMAGE,
+    )
+    deadline = time.monotonic() + 60
+    while True:
+        created = subprocess.run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--network",
+                network,
+                "--entrypoint",
+                "curl",
+                image,
+                "-sS",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                "--aws-sigv4",
+                "aws:amz:us-east-1:s3",
+                "--user",
+                access_key + ":" + secret_key,
+                "-H",
+                "x-amz-content-sha256: " + EMPTY_SHA256,
+                "-X",
+                "PUT",
+                "http://" + storage + ":9000/" + bucket,
+            ],
+            text=True,
+            capture_output=True,
+        ).stdout
+        if created in ("200", "409"):
+            break
+        assert time.monotonic() < deadline, created
+        time.sleep(1)
+
+    refused({}, "Set ADMIN_EMAIL and ADMIN_PASSWORD")
+    refused({"PORT": "8080"}, "PORT must be an integer")
+    refused({"AUTH_MODE": "local_noauth"}, "AUTH_MODE must be password")
+    refused(
+        {"ADMIN_EMAIL": email, "ADMIN_PASSWORD": password},
+        "data from the previous OpenSEO image",
+        legacy=True,
+    )
+
+    start({"ADMIN_EMAIL": email, "ADMIN_PASSWORD": password})
+    operator_secret = json.loads(
+        docker("exec", name, "cat", "/config/secrets.json")
+    )["OPENSEO_OPERATOR_SECRET"]
+    for path in ["/api/standalone/admin", "/api/standalone/import", "/api/standalone/admin/"]:
+        status, body, _ = post_json(
+            path, {"command": "begin"}, {"x-openseo-operator-secret": operator_secret}
         )
+        assert (status, body) == (404, "Not found"), (path, status, body[:200])
     assert call("/cdn-cgi/handler/scheduled")[0] == 404
-    assert call("/mcp", {"Authorization": "Bearer invalid"})[0] == 401
-    assert call("/", {"Cookie": "openseo_gate=invalid"})[0] == 401
-    wrong_basic = "Basic " + base64.b64encode(b"admin:invalid").decode()
-    assert not call("/", {"Authorization": wrong_basic})[2].get("Set-Cookie")
-    status, _, headers = call("/", {"Authorization": basic})
-    assert status == 200
-    cookie = headers["Set-Cookie"].split(";")[0]
-    assert call("/", {"Cookie": cookie})[0] == 200
-    assert call("/", {"Cookie": "prefix_" + cookie})[0] == 401
-    assert call("/mcp", {"Cookie": cookie})[0] == 401
-    status, body, _ = call("/api/health", {"Authorization": basic})
-    assert status == 200
-    health = json.loads(body)
-    assert health["checks"]["database"]["status"] == "ok", health
-    assert health["checks"]["dataforseo"]["status"] == "warn", health
+    status, body, _ = post_json(
+        "/api/auth/sign-up/email",
+        {"email": "intruder@example.com", "password": "intruder-password", "name": "x"},
+    )
+    assert status == 403 and "Registration is closed" in body, (status, body)
+    assert sign_in(email, "wrong-password")[0] == 401
+    status, cookie = sign_in(email, password)
+    assert status == 200 and cookie, status
+    status, body, _ = post_json(
+        "/api/auth/api-key/create", {"name": "smoke"}, {"Cookie": cookie}
+    )
+    assert status == 200, (status, body[:200])
+    key = json.loads(body)["key"]
     rpc(
+        key,
         "initialize",
         {
             "protocolVersion": "2025-03-26",
@@ -174,53 +260,48 @@ try:
             "clientInfo": {"name": "railway-image-smoke", "version": "1.0"},
         },
     )
-    tools = rpc("tools/list")["tools"]
+    tools = rpc(key, "tools/list")["tools"]
     assert len(tools) > 0
-    created = rpc(
-        "tools/call",
-        {
-            "name": "create_project",
-            "arguments": {"name": "Persistence check", "domain": "example.com"},
-        },
-    )
-    assert not created.get("isError"), created
-    before = rpc("tools/call", {"name": "list_projects", "arguments": {}})
-    assert "Persistence check" in json.dumps(before), before
-    assert before["_meta"]["url"] == "https://openseo.test/", before
-    stats = docker(
-        "stats", "--no-stream", "--format", "{{.MemUsage}} {{.CPUPerc}}", name
-    )
-    docker("stop", "-t", "15", name)
-    logs = docker("logs", name)
-    assert "No startup build." in logs
-    assert "Building client + server" not in logs
-    docker("rm", name)
-    username = "personal-user"
-    # This fixture validates configuration only; no paid vendor request is made.
-    dataforseo_key = base64.b64encode(b"ci@example.com:runtime-only-fixture").decode()
-    start({"DATAFORSEO_API_KEY": dataforseo_key})
-    assert call("/", {"Authorization": basic})[0] == 401
-    assert call("/", {"Cookie": cookie})[0] == 401
-    custom_basic = (
-        "Basic " + base64.b64encode((username + ":" + password).encode()).decode()
-    )
-    assert call("/", {"Authorization": custom_basic})[0] == 200
-    status, body, _ = call("/api/health", {"Authorization": custom_basic})
-    assert status == 200
-    assert json.loads(body)["checks"]["dataforseo"]["status"] == "ok", body
-    after = rpc("tools/call", {"name": "list_projects", "arguments": {}})
-    assert not after.get("isError"), after
+    created = tool(key, "create_project", {"name": "Persistence check", "domain": "example.com"})
+    project = created["structuredContent"]["project"]["id"]
+    assert created["_meta"]["url"].startswith(origin + "/"), created
+
+    tool(key, "run_site_audit", {"projectId": project, "url": "https://example.com", "maxPages": 10})
+    deadline = time.monotonic() + 120
+    while True:
+        audits = tool(key, "list_site_audits", {"projectId": project})
+        audit = audits["structuredContent"]["audits"][0]
+        if audit["status"] in ("completed", "failed"):
+            break
+        assert time.monotonic() < deadline, audit
+        time.sleep(2)
+    pages = tool(key, "get_audit_pages", {"projectId": project, "auditId": audit["id"]})
+    assert "| 200 | ok |" in pages["content"][0]["text"], pages
+
+    before = tool(key, "list_projects", {})
+    stats = docker("stats", "--no-stream", "--format", "{{.MemUsage}} {{.CPUPerc}}", name)
+    logs = stop()
+    assert "create-user succeeded" in logs, logs
+
+    other_password = secrets.token_hex(16)
+    start({"ADMIN_EMAIL": "other@example.com", "ADMIN_PASSWORD": other_password})
+    assert sign_in(email, password)[0] == 200
+    assert sign_in("other@example.com", other_password)[0] == 401
+    after = tool(key, "list_projects", {})
     assert after == before, (before, after)
+    logs = stop()
+    assert "create-user" not in logs, logs
+
     print(
         json.dumps(
             {
-                "authentication": "passed",
-                "custom_username": "passed",
+                "administrator": "passed",
+                "registration_closed": "passed",
+                "private_endpoints": "passed",
                 "mcp_tools": len(tools),
+                "crawl_gateway": "passed",
                 "persistence": "passed",
-                "runtime_integration_variables": "passed",
-                "startup_build": False,
-                "limits": {"cpu": 0.5, "memory": "1 GiB"},
+                "limits": {"cpu": 1, "memory": "2 GiB"},
                 "runtime_snapshot": stats,
             }
         )
@@ -229,6 +310,8 @@ finally:
     state = subprocess.run(["docker", "inspect", name], text=True, capture_output=True)
     if state.returncode == 0:
         if sys.exc_info()[0] is not None:
-            print(docker("logs", "--tail", "100", name, check=False), file=sys.stderr)
+            print(logs_of(name)[-6000:], file=sys.stderr)
         docker("rm", "-f", name, check=False)
-    docker("volume", "rm", volume, check=False)
+    docker("rm", "-f", storage, check=False)
+    docker("volume", "rm", volume, storage_volume, check=False)
+    docker("network", "rm", network, check=False)

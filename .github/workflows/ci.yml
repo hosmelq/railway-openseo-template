@@ -33,7 +33,6 @@ on:
       - .github/workflows/**
       - Caddyfile
       - Dockerfile
-      - build-fingerprint.mjs
       - railway-entrypoint.mjs
       - tests/**
 

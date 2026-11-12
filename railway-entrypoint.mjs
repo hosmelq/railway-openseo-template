@@ -1,206 +1,185 @@
 import { execFileSync, spawn } from "node:child_process";
-import { createHmac } from "node:crypto";
-import { mkdirSync, readdirSync, readlinkSync, unlinkSync } from "node:fs";
-import { createServer } from "node:http";
-import { join } from "node:path";
+import {
+  existsSync,
+  lchownSync,
+  mkdirSync,
+  readFileSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
 
-const password = process.env.ACCESS_PASSWORD;
-const username = process.env.ACCESS_USERNAME ?? "admin";
-if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$/.test(username)) {
-  console.error(
-    "ACCESS_USERNAME must be 1-64 letters, numbers, underscores, dots or hyphens, starting with a letter or number.",
-  );
+function fail(message) {
+  console.error(`[railway] ${message}`);
   process.exit(1);
 }
-if (!password || !/^[a-zA-Z0-9]{32,}$/.test(password)) {
-  console.error(
-    "ACCESS_PASSWORD is required: use at least 32 letters and numbers.",
+
+if (statSync("/data").dev === statSync("/").dev)
+  fail("Mount a Railway volume at /data.");
+if (existsSync("/data/state"))
+  fail(
+    "This volume holds data from the previous OpenSEO image (/data/state). Keep that service on ghcr.io/hosmelq/railway-openseo-template:latest, or deploy this edition as a new service with its own volume.",
   );
-  process.exit(1);
-}
-const port = process.env.PORT || "8080";
+const storageKeys = [
+  "CELLD_BUCKET",
+  "S3_ENDPOINT",
+  "AWS_REGION",
+  "AWS_ACCESS_KEY_ID",
+  "AWS_SECRET_ACCESS_KEY",
+];
+for (const key of storageKeys)
+  if (!process.env[key])
+    fail(`${key} is required: reference it from the Railway Bucket.`);
+const port = process.env.PORT || "3000";
 if (
   !/^\d+$/.test(port) ||
-  Number(port) < 1 ||
+  Number(port) < 1024 ||
   Number(port) > 65535 ||
-  [3001, 3002].includes(Number(port))
-) {
-  console.error(
-    "PORT must be an integer between 1 and 65535, except internal ports 3001 and 3002.",
+  [8080, 8081, 8090].includes(Number(port))
+)
+  fail(
+    "PORT must be an integer between 1024 and 65535, except internal ports 8080, 8081 and 8090.",
   );
-  process.exit(1);
+const publicUrl =
+  process.env.BETTER_AUTH_URL ||
+  (process.env.RAILWAY_PUBLIC_DOMAIN &&
+    `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`);
+if (!publicUrl)
+  fail("Generate a Railway domain or set BETTER_AUTH_URL to the public URL.");
+if ((process.env.AUTH_MODE || "password") !== "password")
+  fail("AUTH_MODE must be password: a Railway domain is public.");
+
+for (const directory of ["/data", "/data/config", "/data/celld"]) {
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  lchownSync(directory, 1000, 1000);
 }
-process.chdir("/app");
-execFileSync(process.execPath, ["/opt/railway/build-fingerprint.mjs"], {
-  stdio: "inherit",
-});
-if (readlinkSync("/app/.wrangler/state") !== "/data/state") {
-  throw new Error(
-    "Mount the persistent volume at /data. Do not mount over /app/.wrangler.",
-  );
-}
-mkdirSync("/data/state", { recursive: true });
-// Preview must load current runtime bindings even if an image update leaves
-// a generated build-time snapshot in the container filesystem.
-function clearBuildBindings(directory) {
-  for (const entry of readdirSync(directory, { withFileTypes: true })) {
-    const file = join(directory, entry.name);
-    if (entry.isDirectory()) clearBuildBindings(file);
-    else if (entry.isFile() && entry.name.startsWith(".dev.vars"))
-      unlinkSync(file);
-  }
-}
-clearBuildBindings("/app/dist");
-const appEnv = {
+process.setgroups([1000]);
+process.setgid(1000);
+process.setuid(1000);
+
+const storageEnv = {
   ...process.env,
-  ALLOWED_HOST:
-    process.env.ALLOWED_HOST ||
-    process.env.RAILWAY_PUBLIC_DOMAIN ||
-    "localhost",
-  PORT: "3001",
+  AUTH_MODE: "password",
+  BETTER_AUTH_URL: publicUrl,
+  HOME: "/home/node",
+  PORT: port,
 };
-// Credentials are consumed by Caddy and never forwarded to OpenSEO.
-delete appEnv.ACCESS_PASSWORD;
-delete appEnv.ACCESS_USERNAME;
+delete storageEnv.ADMIN_PASSWORD;
+const env = { ...storageEnv };
+for (const key of storageKeys) delete env[key];
+const run = (command, args, options = {}) =>
+  execFileSync(command, args, { env, stdio: "inherit", ...options });
 
 const children = new Set();
-const shutdown = new AbortController();
-async function checkReadiness(signal = AbortSignal.timeout(5000)) {
-  const upstream = await fetch("http://127.0.0.1:3001/api/health", { signal });
-  const setup = await upstream.json();
-  if (!upstream.ok || setup.checks?.database?.status !== "ok")
-    throw new Error("Not ready");
-}
-const healthServer = createServer(async (request, response) => {
-  if (request.url !== "/healthz") {
-    response.writeHead(404).end("Not found");
-    return;
-  }
-  try {
-    await checkReadiness();
-    response.writeHead(200, { "Content-Type": "text/plain" }).end("ok");
-  } catch {
-    response.writeHead(503, { "Content-Type": "text/plain" }).end("Not ready");
-  }
-});
 let stopping = false;
-let stopTimer;
 function stop(code = 0) {
   if (stopping) return;
   stopping = true;
-  shutdown.abort();
   process.exitCode = code;
-  healthServer.close();
   for (const child of children) child.kill("SIGTERM");
-  stopTimer = setTimeout(() => {
+  setTimeout(() => {
     for (const child of children) child.kill("SIGKILL");
-  }, 8000);
-  stopTimer.unref();
+  }, 50_000).unref();
 }
 process.on("SIGTERM", () => stop());
 process.on("SIGINT", () => stop());
-function launch(command, args, env, service = false) {
-  const child = spawn(command, args, { env, stdio: "inherit" });
+function launch(name, command, args, childEnv = env) {
+  const child = spawn(command, args, { env: childEnv, stdio: "inherit" });
   children.add(child);
-  return new Promise((resolve, reject) => {
-    child.once("error", reject);
-    child.once("exit", (code, signal) => {
-      children.delete(child);
-      if (!children.size && stopTimer) clearTimeout(stopTimer);
-      if (service && !stopping) {
-        console.error(`[railway] ${command} stopped unexpectedly.`);
-        stop(code || 1);
-      }
-      if (code === 0 || stopping) resolve();
-      else reject(new Error(`${command} exited with ${code ?? signal}.`));
-    });
+  child.once("exit", (code, signal) => {
+    children.delete(child);
+    if (!stopping) {
+      console.error(`[railway] ${name} stopped (${code ?? signal}).`);
+      stop(code || 1);
+    }
   });
 }
-
-async function waitForReadiness() {
-  const signal = AbortSignal.any([
-    shutdown.signal,
-    AbortSignal.timeout(120_000),
-  ]);
-  while (!signal.aborted) {
+async function retry(description, attempts, interval, action) {
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    if (stopping) throw new Error("Stopped during startup.");
     try {
-      await checkReadiness(
-        AbortSignal.any([signal, AbortSignal.timeout(5000)]),
-      );
-      return;
-    } catch {
-      // OpenSEO may still be starting or opening its database.
+      return await action();
+    } catch (error) {
+      if (attempt === attempts)
+        throw new Error(`${description}: ${error.message}`);
     }
-    try {
-      await delay(250, undefined, { signal });
-    } catch {
-      break;
-    }
+    await delay(interval);
   }
-  if (!stopping)
-    throw new Error("OpenSEO did not become ready within 120 seconds.");
+}
+async function post(url) {
+  const response = await fetch(url, { method: "POST" });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
 }
 
 try {
-  await launch(
-    "pnpm",
-    ["exec", "tsx", "scripts/selfhost-preflight.ts"],
-    appEnv,
+  launch(
+    "celld",
+    "celld",
+    ["--listen", "127.0.0.1:8080", "--internal-listen", "127.0.0.1:8081"],
+    storageEnv,
   );
-  if (!stopping) await launch("pnpm", ["run", "db:migrate:local"], appEnv);
-  if (!stopping) {
-    await new Promise((resolve, reject) => {
-      healthServer.once("error", reject);
-      healthServer.listen(3002, "127.0.0.1", resolve);
-    });
-    const gatewayEnv = {
-      ...process.env,
-      ACCESS_USERNAME: username,
-      GATE_COOKIE: createHmac("sha256", password)
-        .update(`openseo-browser-session-v1:${username}`)
-        .digest("hex"),
-      PASSWORD_HASH: execFileSync(
-        "caddy",
-        ["hash-password", "--plaintext", password],
-        { encoding: "utf8" },
-      ).trim(),
-      PORT: port,
-    };
-    execFileSync(
-      "caddy",
-      [
-        "validate",
-        "--config",
-        "/opt/railway/Caddyfile",
-        "--adapter",
-        "caddyfile",
-      ],
-      { env: gatewayEnv, stdio: "inherit" },
+  run("node", ["/opt/standalone/configure.mjs"]);
+  const wranglerFile = "/config/app/wrangler.json";
+  const config = JSON.parse(readFileSync(wranglerFile, "utf8"));
+  config.vars.CRAWL_GATEWAY_URL = "http://127.0.0.1:8090";
+  writeFileSync(wranglerFile, JSON.stringify(config), { mode: 0o600 });
+  launch("crawl gateway", "node", ["/opt/standalone/crawl-gateway.mjs"]);
+
+  await retry("Deployment failed", 30, 2000, () =>
+    run("celld", ["deploy", "/config/app"], { env: storageEnv }),
+  );
+  await retry("Runtime did not load the deployment", 90, 1000, () =>
+    post("http://127.0.0.1:8081/reload"),
+  );
+  await retry("Database migrations did not apply", 30, 2000, () =>
+    run(
+      "celld",
+      ["d1", "migrations", "apply", "openseo-standalone", "/config/app"],
+      { env: storageEnv },
+    ),
+  );
+  await post("http://127.0.0.1:8081/reload");
+  await retry("OpenSEO did not become ready", 90, 1000, async () => {
+    const response = await fetch("http://127.0.0.1:8080/api/health");
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  });
+
+  const users = run(
+    "celld",
+    [
+      "d1",
+      "execute",
+      "openseo-standalone",
+      "--command",
+      "SELECT 'users=' || count(*) FROM user",
+      "/config/app",
+    ],
+    { env: storageEnv, stdio: ["ignore", "pipe", "inherit"], encoding: "utf8" },
+  );
+  const count = Number(/users=(\d+)/.exec(users)?.[1]);
+  if (!Number.isInteger(count)) throw new Error(`Unexpected user count: ${users}`);
+  if (count === 0) {
+    const email = process.env.ADMIN_EMAIL;
+    const password = process.env.ADMIN_PASSWORD;
+    if (!email || !password)
+      throw new Error(
+        "Set ADMIN_EMAIL and ADMIN_PASSWORD to create the administrator account.",
+      );
+    run(
+      "node",
+      ["/opt/standalone/admin.mjs", "create-user", email, process.env.ADMIN_NAME || "Admin"],
+      { input: `${password}\n`, stdio: ["pipe", "inherit", "inherit"] },
     );
-    console.log(
-      "[railway] Starting prebuilt OpenSEO and its scheduler. No startup build.",
-    );
-    await Promise.all([
-      launch(
-        process.execPath,
-        ["scripts/selfhost-scheduler.mjs"],
-        appEnv,
-        true,
-      ),
-      (async () => {
-        await waitForReadiness();
-        if (stopping) return;
-        console.log("[railway] OpenSEO and its database are ready. Starting Caddy.");
-        await launch(
-          "caddy",
-          ["run", "--config", "/opt/railway/Caddyfile", "--adapter", "caddyfile"],
-          gatewayEnv,
-          true,
-        );
-      })(),
-    ]);
   }
+
+  console.log("[railway] OpenSEO is ready. Starting Caddy.");
+  launch("caddy", "caddy", [
+    "run",
+    "--config",
+    "/opt/railway/Caddyfile",
+    "--adapter",
+    "caddyfile",
+  ]);
 } catch (error) {
   console.error(`[railway] ${error.message}`);
   stop(1);
