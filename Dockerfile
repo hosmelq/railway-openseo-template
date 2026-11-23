@@ -1,5 +1,5 @@
 ARG CADDY_IMAGE=caddy:2.11.9-alpine@sha256:003a97808e781aa9f7e75cc2f43d34d461099031faf5e20faefb9f61126836f0
-ARG OPENSEO_IMAGE=ghcr.io/every-app/open-seo-standalone:v0.1.31@sha256:12e9f062b70c90e6b51c882e8cf27c940b95cdf9929b2dbe4b06b15c032272bf
+ARG OPENSEO_IMAGE=ghcr.io/every-app/open-seo-standalone:v0.1.32@sha256:56a97ad042287d7a7aa252db55aaaea795b5357cef1f41c47fceb86de97a1a80
 FROM ${CADDY_IMAGE} AS caddy
 FROM ${OPENSEO_IMAGE}
 
